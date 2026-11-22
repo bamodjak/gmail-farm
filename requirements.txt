@@ -1,0 +1,4 @@
+curl_cffi>=0.7
+# Browser fallback path only (gmail_farm/browser.py):
+selenium>=4.15.0
+webdriver-manager>=4.0.0
