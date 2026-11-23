@@ -140,11 +140,18 @@ WARM_UP_DEEP_SITES = [
 # direct URL — there is no technical bypass, only the hypothesis
 # (unverified) that starting from a service Google trusts more
 # lowers the risk score. 'direct' is the plain signup URL.
+# 'cloud-console' is the entry point the google-qr-sms-helper post
+# names (start sign-in from Google Cloud Console / Cloud Shell):
+# never tested for SIGNUP before 2026-11-23. 'play' (Play Store
+# web) and 'aistudio' (AI Studio) are other untested services.
 ENTRY_POINTS = {
     "direct": None,
     "youtube": "https://www.youtube.com",
     "drive": "https://drive.google.com",
     "photos": "https://photos.google.com",
+    "cloud-console": "https://console.cloud.google.com",
+    "play": "https://play.google.com",
+    "aistudio": "https://aistudio.google.com",
 }
 
 
@@ -190,6 +197,30 @@ def _enter_via(driver, entry_point):
         _click_text(driver, "Go to", timeout=5)
     if not _click_text(driver, "Create account", timeout=8):
         _log.warning("entry point %s: 'Create account' not found", entry_point)
+        return False
+    # Cloud Console's "Create account" goes to
+    # accounts.cloud.google.com/signup/email (enter an existing
+    # email) — there is NO "For my personal use" choice there.
+    # "Get a new email address instead" leads to the lifecycle
+    # username step (service=cloudconsole, continue to the Cloud
+    # free-trial ToS). Verified by probe 2026-11-23.
+    if entry_point == "cloud-console":
+        if not _click_text(driver, "Get a new email address instead",
+                           timeout=8):
+            _log.warning("entry point %s: 'Get a new email address "
+                         "instead' not found", entry_point)
+            return False
+        time.sleep(2)
+        if ("username" in (driver.current_url or "")
+                or _smart_find(driver, [("id", "username"),
+                                        ("xpath",
+                                         "//input[@name='Username']")],
+                               timeout=5) is not None):
+            _log.info("entry point %s: reached the signup form "
+                      "(username step)", entry_point)
+            return True
+        _log.warning("entry point %s: did not reach the signup form (%s)",
+                     entry_point, driver.current_url)
         return False
     if not _click_text(driver, "For my personal use", timeout=8):
         _log.warning("entry point %s: 'For my personal use' not found",
@@ -1788,6 +1819,39 @@ def create_account(identity: Identity, phone: str | None = None,
                 if "birthdaygender" in driver.current_url:
                     errors = [ln for ln in body.split("\n")
                               if "Please enter" in ln or "Please select" in ln]
+                    # Diagnostics: the birthday page varies by flow
+                    # (the Cloud Console variant failed here
+                    # 2026-11-23 with no visible error text) — save
+                    # the page source + the actual inputs so the
+                    # field IDs can be fixed instead of guessed.
+                    try:
+                        import os as _os3
+                        _dump_dir = _os3.path.join(_os3.getcwd(), "runs")
+                        _os3.makedirs(_dump_dir, exist_ok=True)
+                        _stamp = time.strftime("%Y%m%d-%H%M%S")
+                        _dump = _os3.path.join(
+                            _dump_dir,
+                            f"birthday-{identity.username}-{_stamp}.html")
+                        with open(_dump, "w", encoding="utf-8") as _f:
+                            _f.write(driver.page_source or "")
+                        _log.info("birthday page source saved to %s", _dump)
+                        _inputs = driver.find_elements(
+                            "xpath", "//input | //select | //div[@role='combobox']")
+                        _desc = []
+                        for _el in _inputs[:20]:
+                            try:
+                                _desc.append(
+                                    f"{_el.tag_name}[id="
+                                    f"{_el.get_attribute('id') or ''} "
+                                    f"name={_el.get_attribute('name') or ''} "
+                                    f"type={_el.get_attribute('type') or ''} "
+                                    f"text={(_el.text or '')[:30]!r}]")
+                            except Exception:  # noqa: BLE001 - best-effort
+                                pass
+                        _log.info("birthday page controls: %s",
+                                  " | ".join(_desc))
+                    except Exception as _exc:  # noqa: BLE001 - best-effort
+                        _log.warning("birthday diagnostics failed: %s", _exc)
                     return BrowserResult(
                         "blocked", identity.email,
                         "birthday step did not advance: "

@@ -106,9 +106,10 @@ class Config:
     # — Google still shows the QR wall. Android variant untested.
     device: str = "desktop"
     # Bulk path (browser route only): alternative signup entry point
-    # ('direct' default, or 'youtube' / 'drive' / 'photos') — start
-    # the signup from a Google service instead of the direct URL
-    # (ytgm). 'direct' is the plain signup URL.
+    # ('direct' default, or 'youtube' / 'drive' / 'photos' /
+    # 'cloud-console' / 'play' / 'aistudio') — start the signup
+    # from a Google service instead of the direct URL (ytgm).
+    # 'direct' is the plain signup URL.
     entry_point: str = "direct"
     # Persistent Chrome profile directory (browser route only):
     # when set, cookies/history survive across attempts so the
@@ -155,8 +156,10 @@ class Config:
                              "or 'android-phone'")
         if self.device != "desktop" and not self.browser:
             raise ValueError("--device only applies with --browser")
-        if self.entry_point not in ("direct", "youtube", "drive", "photos"):
-            raise ValueError("--entry-point must be direct, youtube, drive or photos")
+        if self.entry_point not in ("direct", "youtube", "drive", "photos",
+                                   "cloud-console", "play", "aistudio"):
+            raise ValueError("--entry-point must be direct, youtube, drive, "
+                             "photos, cloud-console, play or aistudio")
         if self.entry_point != "direct" and not self.browser:
             raise ValueError("--entry-point only applies with --browser")
         if self.profile_dir and not self.browser:
@@ -243,13 +246,16 @@ def build_config(argv: list[str] | None = None) -> Config:
                    "Google still shows the QR wall), or "
                    "android-phone — Pixel 8 / Android 14 Chrome "
                    "[default: desktop]")
-    p.add_argument("--entry-point", choices=["direct", "youtube", "drive", "photos"],
+    p.add_argument("--entry-point",
+                   choices=["direct", "youtube", "drive", "photos",
+                            "cloud-console", "play", "aistudio"],
                    default=os.environ.get("GMAIL_FARM_ENTRY_POINT", "direct"),
                    help="browser signup entry point (browser route "
                    "only): start from a Google service instead of the "
                    "direct signup URL — youtube, drive or photos "
-                   "(ytgm; unverified whether it lowers the risk "
-                   "score) [default: direct]")
+                   "(ytgm), cloud-console (the google-qr-sms-helper "
+                   "entry point, untested for signup), play (Play "
+                   "Store web), aistudio (AI Studio) [default: direct]")
     p.add_argument("--profile-dir", default=os.environ.get("GMAIL_FARM_PROFILE_DIR", ""),
                    help="persistent Chrome profile directory (browser "
                    "route only): cookies/history survive across "
