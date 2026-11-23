@@ -6,23 +6,37 @@ What this does, step by step:
      the lifecycle RPC endpoint, the reCAPTCHA site key, the TL flow
      token and the session tokens. This step is proven to work.
   2. Steps: submit each signup step to the lifecycle RPC service
-     (AccountLifecyclePlatformSignupUi) using Google's standard WIZ
-     `f.req` POST format. Steps in order: name -> username ->
-     password -> birthday/gender -> phone verification -> terms.
+     (AccountLifecyclePlatformSignupUi) using Google's WIZ
+     "batchexecute" format (POST .../data/batchexecute with
+     f.req=[[["<rpcId>","<json>",null,"generic"]]]). Steps in order:
+     name -> username -> password -> birthday/gender -> phone
+     verification -> terms. The name step uses the first of the 8
+     tM7Xoe candidate method ids from the page (unverified — see
+     the note below).
   3. Stage detection: after every response, classify where the flow
      is — created / phone_verification / captcha / selfie / blocked /
      username_taken / error — from the response body and status, and
      stop cleanly at any verification step. This module NEVER enters
      a phone number and NEVER attempts to solve a CAPTCHA.
 
-Why the RPC layer is best-effort (read this before assuming it works):
-  Google does not document or publish this flow. The step method
-  names and payload shapes live only in Google's minified JS bundle
-  and are obfuscated. The driver therefore sends the standard WIZ
-  `f.req` call to the discovered endpoint and reports the server's
-  exact response. If Google rejects it (unknown method / bad payload),
-  the attempt is recorded as stage=rpc_rejected with the response —
-  that is a real, reportable result, not a silent failure.
+Why the RPC layer stops where it does (read this before assuming it works):
+  The RPC endpoint and wire format ARE now known (reverse-engineered
+  2026-11-22, see RPC-REVERSE-2026-11-22.md): the service is a Google
+  WIZ "batchexecute" RPC at
+  .../AccountLifecyclePlatformSignupUi/data/batchexecute, with
+  f.req=[[["<rpcId>","<json>",null,"generic"]]] and at=<SNlM0e>.
+  The XSRF token (SNlM0e) is accepted — the server's own error
+  responses prove it (no at -> 400 XSRF; with at -> past that check).
+  But the call then returns 401 UNAUTHENTICATED (gRPC code 16) for
+  ANY rpcId/payload: the service requires a BotGuard attestation
+  produced by the bscframe JS challenge running in a real browser.
+  Plain HTTP cannot produce it (the bscframe returns an empty shell,
+  the page sets no cookies, and the challenge needs JS execution).
+  So the HTTP path is gated at the attestation layer, not at the
+  method-name layer. The rpcId used here is the first of the 8
+  tM7Xoe candidate method ids from the page — a candidate, not a
+  verified method, because no method id can be confirmed live until
+  the attestation is satisfied.
 
   Even with a perfect RPC replay, the flow ends at phone verification
   (SMS / QR / same-device) and can also require a reCAPTCHA token and
@@ -70,8 +84,12 @@ _STAGE_MARKERS: dict[str, list[str]] = {
 }
 
 # The lifecycle RPC service discovered from the signup page
-# (window.WIZ_global_data: Im6cmf / eptZe).
-RPC_PATH = "/lifecycle/_/AccountLifecyclePlatformSignupUi"
+# (window.WIZ_global_data: Im6cmf / eptZe). The service is a Google
+# WIZ "batchexecute" RPC: the method is NOT a URL path segment (that
+# 404s) — it is an rpcId inside a triple-nested f.req posted to the
+# .../data/batchexecute endpoint. See RPC-REVERSE-2026-11-22.md.
+RPC_BASE_PATH = "/lifecycle/_/AccountLifecyclePlatformSignupUi"
+RPC_PATH = RPC_BASE_PATH + "/data/batchexecute"
 
 
 @dataclass
@@ -80,9 +98,18 @@ class FlowState:
 
     cookies: dict[str, str] = field(default_factory=dict)
     rpc_endpoint: str = ""          # full URL of the lifecycle service
+    rpc_batchexecute_url: str = ""  # .../data/batchexecute (the RPC endpoint)
     recaptcha_site_key: str = ""    # reCAPTCHA site key embedded in the page
     tl_token: str = ""              # TL flow token (URL-decoded)
     session_token: str = ""         # SNlM0e token from WIZ_global_data
+    f_sid: str = ""                 # FdrFJe (batchexecute f.sid query param)
+    bl_token: str = ""              # cfb2h (batchexecute bl query param)
+    soc_app: str = ""               # MUE6Ne (batchexecute soc-app query param)
+    rpc_ids: list[str] = field(default_factory=list)  # tM7Xoe: 8 candidate
+    # method ids (as strings) for the signup steps. The name step is
+    # CANDIDATE rpc_ids[0] — unverified, because the RPC is gated by a
+    # BotGuard attestation that plain HTTP cannot produce (see
+    # RPC-REVERSE-2026-11-22.md), so no method id can be confirmed live.
     page_ok: bool = False
 
 
@@ -126,13 +153,31 @@ class SignupFlow:
                         "(status=%s, len=%d)", resp.status_code, len(body))
             return state
 
-        # RPC endpoint: Im6cmf in WIZ_global_data.
+        # RPC endpoint: Im6cmf in WIZ_global_data (no trailing slash).
         m = re.search(r'"Im6cmf"\s*:\s*"([^"]+)"', body)
         if m:
             path = m.group(1)
             state.rpc_endpoint = "https://accounts.google.com" + path.rstrip("/") + "/"
         else:
-            state.rpc_endpoint = "https://accounts.google.com" + RPC_PATH + "/"
+            state.rpc_endpoint = "https://accounts.google.com" + RPC_BASE_PATH + "/"
+        # The actual RPC endpoint is the batchexecute path under it.
+        state.rpc_batchexecute_url = state.rpc_endpoint + "data/batchexecute"
+
+        # Batchexecute query params from WIZ_global_data.
+        m = re.search(r'"FdrFJe"\s*:\s*"([^"]+)"', body)
+        if m:
+            state.f_sid = m.group(1)
+        m = re.search(r'"cfb2h"\s*:\s*"([^"]+)"', body)
+        if m:
+            state.bl_token = m.group(1)
+        m = re.search(r'"MUE6Ne"\s*:\s*"([^"]+)"', body)
+        if m:
+            state.soc_app = m.group(1)
+        # Candidate RPC method ids: tM7Xoe is a list of 8 numbers in
+        # WIZ_global_data (one per signup step, order unverified).
+        m = re.search(r'"tM7Xoe"\s*:\s*\[([0-9,\s]+)\]', body)
+        if m:
+            state.rpc_ids = [s.strip() for s in m.group(1).split(",") if s.strip()]
 
         # reCAPTCHA site key: ecWwgb in WIZ_global_data.
         m = re.search(r'"ecWwgb"\s*:\s*"([^"]+)"', body)
@@ -149,10 +194,11 @@ class SignupFlow:
         if m:
             state.session_token = m.group(1)
 
-        log.info("bootstrap ok: rpc=%s recaptcha=%s tl=%s",
+        log.info("bootstrap ok: rpc=%s recaptcha=%s tl=%s rpc_ids=%d",
                  state.rpc_endpoint,
                  bool(state.recaptcha_site_key),
-                 bool(state.tl_token))
+                 bool(state.tl_token),
+                 len(state.rpc_ids))
         return state
 
     # -- stage detection --------------------------------------------------
@@ -163,13 +209,40 @@ class SignupFlow:
             return "blocked", f"HTTP {status} (rate limited)"
         if status >= 500:
             return "error", f"HTTP {status} (server error)"
+        if status == 401:
+            # The batchexecute endpoint returns 401 UNAUTHENTICATED
+            # (gRPC code 16) when the XSRF token passes but the
+            # BotGuard attestation is missing. Plain HTTP cannot
+            # produce that attestation (it needs the bscframe JS
+            # challenge to run in a real browser), so this is the
+            # terminal gate for the HTTP path.
+            return "blocked", (
+                "HTTP 401 (unauthenticated — BotGuard attestation "
+                "required; not producible over plain HTTP)"
+            )
         if status in (400, 403):
+            # A 400 on batchexecute with an "xsrf" error means the at
+            # token was missing/rejected; a 400 without it is a bad
+            # request (wrong rpcId / payload shape).
+            if "xsrf" in (body or "").lower():
+                return "blocked", "HTTP 400 (XSRF token rejected)"
             return "blocked", f"HTTP {status}"
         if status == 404:
             # A 404 on the lifecycle RPC means the method path does not
             # exist — the step call was rejected at the routing layer.
             return "rpc_rejected", "HTTP 404 (RPC method path not found)"
         text = (body or "").lower()
+        # A successful batchexecute call returns a )]}' chunked body
+        # with a "wrb.fr" result frame for our rpcId.
+        if "wrb.fr" in text:
+            for stage, markers in _STAGE_MARKERS.items():
+                for marker in markers:
+                    if marker in text:
+                        return stage, f"marker: {marker!r}"
+            return "unknown", (
+                f"HTTP {status}, RPC accepted (wrb.fr) but no known "
+                f"stage marker in the result"
+            )
         for stage, markers in _STAGE_MARKERS.items():
             for marker in markers:
                 if marker in text:
@@ -179,15 +252,33 @@ class SignupFlow:
         return "unknown", f"HTTP {status}, no known stage marker"
 
     # -- RPC --------------------------------------------------------------
-    def _rpc(self, state: FlowState, method: str, payload: dict) -> tuple[int, str]:
-        """One WIZ `f.req` RPC call to the lifecycle service.
+    def _rpc(self, state: FlowState, rpc_id: str, payload: dict) -> tuple[int, str]:
+        """One batchexecute RPC call to the lifecycle service.
 
-        Returns (http_status, response_text). Google's WIZ services
-        accept POST with form-encoded f.req=<json> plus the flow token.
+        Google WIZ "batchexecute" format (verified against the live
+        service 2026-11-22, and against the public NotebookLM
+        batchexecute reference):
+          POST <rpc_batchexecute_url>?f.sid=..&bl=..&hl=en_US
+               &soc-app=..&soc-platform=1&soc-device=1&_reqid=..&rt=c
+          form: f.req=[[["<rpcId>","<json>",null,"generic"]]]
+                at=<SNlM0e>  TL=<tl>
+        Returns (http_status, response_text). The response is a )]}'
+        length-prefixed chunk stream; a "wrb.fr" frame is a successful
+        RPC result for our rpcId, an "er" frame is the error.
         """
-        url = state.rpc_endpoint + method
+        qs = {
+            "f.sid": state.f_sid,
+            "bl": state.bl_token,
+            "hl": "en_US",
+            "soc-app": state.soc_app,
+            "soc-platform": "1",
+            "soc-device": "1",
+            "_reqid": "100000",
+            "rt": "c",
+        }
+        url = state.rpc_batchexecute_url + "?" + urllib.parse.urlencode(qs)
         form = {
-            "f.req": json.dumps([None, json.dumps(payload)]),
+            "f.req": json.dumps([[[rpc_id, json.dumps(payload), None, "generic"]]]),
             "at": state.session_token,
             "TL": state.tl_token,
         }
@@ -222,11 +313,16 @@ class SignupFlow:
             return AttemptResult(identity, "dry_run",
                                  "bootstrap only (dry run)", http_status=200)
 
-        # Step 1: name. Method/payload shape is Google's internal
-        # format; if the server rejects it, we record rpc_rejected
-        # with the response instead of guessing further.
+        # Step 1: name, via the batchexecute RPC. The rpcId is the
+        # first of the 8 tM7Xoe candidate method ids from the page
+        # (CANDIDATE — unverified, because the RPC is gated by a
+        # BotGuard attestation that plain HTTP cannot produce, so no
+        # method id can be confirmed live; see
+        # RPC-REVERSE-2026-11-22.md). The payload is the name as a
+        # JSON string, matching the batchexecute "json_params" slot.
+        rpc_id = state.rpc_ids[0] if state.rpc_ids else "105698215"
         try:
-            status, text = self._rpc(state, "SubmitName", {
+            status, text = self._rpc(state, rpc_id, {
                 "firstName": identity.first_name,
                 "lastName": identity.last_name,
             })

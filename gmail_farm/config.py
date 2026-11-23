@@ -60,6 +60,65 @@ class Config:
     dry_run: bool = False
     # Verbose logging.
     verbose: bool = False
+    # Browser route: use a real Chrome browser (Selenium) instead of
+    # plain HTTP. Needed because Google's signup now requires a
+    # BotGuard attestation that only a real browser can produce.
+    browser: bool = False
+    # The user's OWN phone number (E.164, e.g. +15551234567), used
+    # only with --browser when Google asks for phone verification.
+    # The tool never pays for a number: the SMS goes to the user's
+    # own phone and the user types the code at the console prompt.
+    # Empty = try to skip the phone step; if the skip fails the
+    # attempt is abandoned as stage=phone_verification.
+    phone: str = ""
+    # Headed browser (show the Chrome window). Default is headless:
+    # a farm runs on servers with no display. Needs a display.
+    headed: bool = False
+    # QR pause (browser route only): when Google shows the QR-code
+    # verification wall, pause the attempt, save the QR code to a
+    # file, and wait for the user to scan it with their own phone
+    # and press Enter. Default on: without it the QR wall abandons
+    # the attempt. Off = abandon immediately as stage
+    # phone_verification (for non-interactive runs).
+    qr_pause: bool = True
+    # True when the user set --qr-pause / --no-qr-pause explicitly
+    # (used only for validation; the value itself lives in qr_pause).
+    _qr_pause_set: bool = False
+    # QR downgrade (browser route only): at Google's QR / samedevice
+    # verification wall, first try the google-qr-sms-helper downgrade
+    # (DevicePhoneVerification MypxBd/YDtwf RPCs -> [3,null,4]
+    # fallback -> SMS/voice selection page) before pausing for a QR
+    # scan. It enters no phone number and pays nothing — it only
+    # changes which verification Google offers. Default on.
+    qr_downgrade: bool = True
+    # True when the user set --qr-downgrade / --no-qr-downgrade
+    # explicitly (used only for validation).
+    _qr_downgrade_set: bool = False
+    # Device profile for the browser route: 'desktop' (default, a
+    # random desktop Chrome UA) or 'ipad-mini' (the iPad Mini spoof
+    # from google-qr-sms-helper: iPad UA, no Sec-CH-UA headers,
+    # navigator aligned to iPad, touch viewport) or 'android-phone'
+    # (Pixel 8 / Android 14 Chrome UA, Android-consistent Sec-CH-UA
+    # metadata, touch viewport). Google may offer SMS/voice
+    # verification to a mobile device instead of the QR wall.
+    # NOTE (verified live 2026-11-22, after the proxy fix): the
+    # iPad Mini spoof does NOT change the signup verification page
+    # — Google still shows the QR wall. Android variant untested.
+    device: str = "desktop"
+    # Bulk path (browser route only): alternative signup entry point
+    # ('direct' default, or 'youtube' / 'drive' / 'photos') — start
+    # the signup from a Google service instead of the direct URL
+    # (ytgm). 'direct' is the plain signup URL.
+    entry_point: str = "direct"
+    # Persistent Chrome profile directory (browser route only):
+    # when set, cookies/history survive across attempts so the
+    # profile warms up over time (ytgm aging) instead of starting
+    # fresh every time. Unset = a fresh temporary profile.
+    profile_dir: str = ""
+    # Deep warm-up (browser route only): before the signup, run a
+    # ytgm-style warm-up pass (Google searches, YouTube, Maps, News)
+    # in the persistent profile. Only meaningful with --profile-dir.
+    warm: bool = False
 
     def validate(self) -> None:
         """Raise ValueError on any invalid setting."""
@@ -83,6 +142,27 @@ class Config:
             raise ValueError("--out must not be empty")
         if not self.log_file:
             raise ValueError("--log-file must not be empty")
+        if self.phone and not re.match(r"^\+\d{7,15}$", self.phone):
+            raise ValueError("--phone must be in E.164 format, e.g. +15551234567")
+        if self.phone and not self.browser:
+            raise ValueError("--phone only applies with --browser")
+        if self._qr_pause_set and not self.browser:
+            raise ValueError("--qr-pause / --no-qr-pause only applies with --browser")
+        if self._qr_downgrade_set and not self.browser:
+            raise ValueError("--qr-downgrade / --no-qr-downgrade only applies with --browser")
+        if self.device not in ("desktop", "ipad-mini", "android-phone"):
+            raise ValueError("--device must be 'desktop', 'ipad-mini' "
+                             "or 'android-phone'")
+        if self.device != "desktop" and not self.browser:
+            raise ValueError("--device only applies with --browser")
+        if self.entry_point not in ("direct", "youtube", "drive", "photos"):
+            raise ValueError("--entry-point must be direct, youtube, drive or photos")
+        if self.entry_point != "direct" and not self.browser:
+            raise ValueError("--entry-point only applies with --browser")
+        if self.profile_dir and not self.browser:
+            raise ValueError("--profile-dir only applies with --browser")
+        if self.warm and not self.browser:
+            raise ValueError("--warm only applies with --browser")
 
 
 def build_config(argv: list[str] | None = None) -> Config:
@@ -90,9 +170,12 @@ def build_config(argv: list[str] | None = None) -> Config:
     p = argparse.ArgumentParser(
         prog="gmail-farm",
         description=(
-            "Create Google (Gmail) accounts over HTTP, in a loop. "
-            "Stops cleanly at phone verification / CAPTCHA / blocks — "
-            "it never enters a phone number and never pays for anything."
+            "Create Google (Gmail) accounts in a loop. Plain HTTP is "
+            "blocked by Google's BotGuard attestation, so use --browser "
+            "for a real Chrome session. Stops cleanly at phone "
+            "verification / CAPTCHA / blocks — with --phone it uses YOUR "
+            "own number and you type the SMS code at the prompt; it "
+            "never pays for a number and never solves a CAPTCHA."
         ),
     )
     p.add_argument("--count", type=int, default=_env_int("GMAIL_FARM_COUNT", 5),
@@ -125,9 +208,90 @@ def build_config(argv: list[str] | None = None) -> Config:
     p.add_argument("--dry-run", action="store_true",
                    help="bootstrap only; never submit a signup step")
     p.add_argument("--verbose", action="store_true", help="verbose logging")
+    p.add_argument("--browser", action="store_true",
+                   help="use a real Chrome browser (Selenium) instead of "
+                   "plain HTTP; needed because Google's signup requires a "
+                   "BotGuard attestation only a real browser can produce")
+    p.add_argument("--phone", default=os.environ.get("GMAIL_FARM_PHONE", ""),
+                   help="your OWN phone number in E.164 format "
+                   "(e.g. +15551234567), used only with --browser when "
+                   "Google asks for phone verification; the SMS goes to "
+                   "your phone and you type the code at the prompt")
+    p.add_argument("--headed", action="store_true",
+                   help="show the Chrome window (needs a display); "
+                   "default is headless")
+    p.add_argument("--qr-pause", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="pause at Google's QR-verification wall: save "
+                   "the QR code to a file and wait for you to scan it "
+                   "with your phone and press Enter (browser route "
+                   "only) [default: on]")
+    p.add_argument("--qr-downgrade", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="at Google's QR-verification wall, first try "
+                   "the google-qr-sms-helper downgrade (DevicePhone- "
+                   "Verification RPCs -> SMS/voice selection page) "
+                   "before pausing for a QR scan (browser route "
+                   "only) [default: on]")
+    p.add_argument("--device", choices=["desktop", "ipad-mini", "android-phone"],
+                   default=os.environ.get("GMAIL_FARM_DEVICE", "desktop"),
+                   help="browser device profile (browser route only): "
+                   "desktop (default), ipad-mini — the iPad Mini "
+                   "spoof from google-qr-sms-helper (NOTE: verified "
+                   "live 2026-11-22, after the proxy fix, it does "
+                   "NOT change the signup verification page — "
+                   "Google still shows the QR wall), or "
+                   "android-phone — Pixel 8 / Android 14 Chrome "
+                   "[default: desktop]")
+    p.add_argument("--entry-point", choices=["direct", "youtube", "drive", "photos"],
+                   default=os.environ.get("GMAIL_FARM_ENTRY_POINT", "direct"),
+                   help="browser signup entry point (browser route "
+                   "only): start from a Google service instead of the "
+                   "direct signup URL — youtube, drive or photos "
+                   "(ytgm; unverified whether it lowers the risk "
+                   "score) [default: direct]")
+    p.add_argument("--profile-dir", default=os.environ.get("GMAIL_FARM_PROFILE_DIR", ""),
+                   help="persistent Chrome profile directory (browser "
+                   "route only): cookies/history survive across "
+                   "attempts so the profile warms up over time "
+                   "(ytgm aging); unset = a fresh profile per attempt")
+    p.add_argument("--warm", action="store_true",
+                   help="deep warm-up pass before the signup (browser "
+                   "route only): Google searches, YouTube, Maps, News "
+                   "in the persistent profile (ytgm); only meaningful "
+                   "with --profile-dir")
     p.add_argument("--version", action="version", version="gmail-farm 1.0.0")
 
     args = p.parse_args(argv)
+    # --qr-pause / --no-qr-pause: None when not given (env or default
+    # applies); True/False when given explicitly.
+    qr_pause_env = os.environ.get("GMAIL_FARM_QR_PAUSE", "")
+    if args.qr_pause is not None:
+        qr_pause = args.qr_pause
+        qr_pause_set = True
+    elif qr_pause_env.lower() in ("0", "false", "no", "off"):
+        qr_pause = False
+        qr_pause_set = True
+    elif qr_pause_env.lower() in ("1", "true", "yes", "on"):
+        qr_pause = True
+        qr_pause_set = True
+    else:
+        qr_pause = True
+        qr_pause_set = False
+    # --qr-downgrade / --no-qr-downgrade: same pattern (default on).
+    qr_downgrade_env = os.environ.get("GMAIL_FARM_QR_DOWNGRADE", "")
+    if args.qr_downgrade is not None:
+        qr_downgrade = args.qr_downgrade
+        qr_downgrade_set = True
+    elif qr_downgrade_env.lower() in ("0", "false", "no", "off"):
+        qr_downgrade = False
+        qr_downgrade_set = True
+    elif qr_downgrade_env.lower() in ("1", "true", "yes", "on"):
+        qr_downgrade = True
+        qr_downgrade_set = True
+    else:
+        qr_downgrade = True
+        qr_downgrade_set = False
     cfg = Config(
         count=args.count,
         delay_seconds=args.delay,
@@ -144,6 +308,17 @@ def build_config(argv: list[str] | None = None) -> Config:
         max_consecutive_failures=args.max_consecutive_failures,
         dry_run=args.dry_run,
         verbose=args.verbose,
+        browser=args.browser or os.environ.get("GMAIL_FARM_BROWSER", "") in ("1", "true", "yes"),
+        phone=args.phone,
+        headed=args.headed,
+        qr_pause=qr_pause,
+        _qr_pause_set=qr_pause_set,
+        qr_downgrade=qr_downgrade,
+        _qr_downgrade_set=qr_downgrade_set,
+        device=args.device,
+        entry_point=args.entry_point,
+        profile_dir=args.profile_dir,
+        warm=args.warm,
     )
     cfg.validate()
     return cfg
