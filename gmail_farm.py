@@ -9,6 +9,10 @@ Usage:
     python3 gmail_farm.py --count 1 --browser         # real Chrome
     python3 gmail_farm.py --count 1 --browser --phone +15551234567
     python3 gmail_farm.py --count 1 --browser --no-qr-pause  # no waiting
+    python3 gmail_farm.py --check                     # verify the setup, no signup
+    python3 gmail_farm.py --count 1 --browser --stop-at-consent
+        # stop at the DevicePhoneVerification consent page and guide
+        # you to finish the SMS step on your own phone
 
 Plain HTTP is blocked by Google's BotGuard attestation (only a real
 browser can produce it), so --browser (Selenium + Chrome) is the
@@ -31,9 +35,14 @@ mode 600 — it contains passwords, keep it private).
 
 from __future__ import annotations
 
+import contextlib
+import io
 import logging
+import os
 import random
+import shutil
 import signal
+import subprocess
 import sys
 import time
 
@@ -56,6 +65,153 @@ def _on_signal(signum, frame):  # noqa: ARG001
     log.info("signal %s received — finishing the current attempt, then exiting", signum)
 
 
+def _check_import(name: str) -> tuple[bool, str]:
+    """Try to import a module. Returns (ok, version-or-error)."""
+    try:
+        module = __import__(name)
+    except Exception as exc:  # noqa: BLE001 - any import failure
+        message = str(exc).strip().splitlines()
+        return False, message[0] if message else "import failed"
+    return True, getattr(module, "__version__", "") or "installed"
+
+
+def _find_chrome() -> tuple[str | None, str]:
+    """Find a Chrome binary the way browser.create_driver() uses it.
+
+    Returns (path, how): how is 'env' (GMAIL_FARM_CHROME_BIN /
+    CHROME_BIN — used directly), 'standard' (on PATH or a standard
+    install location — ChromeDriver finds it on its own), or 'cache'
+    (a chrome-for-testing cache — ChromeDriver does NOT look there,
+    so the user must set GMAIL_FARM_CHROME_BIN to it). (None, '')
+    when nothing is found.
+    """
+    for env_name in ("GMAIL_FARM_CHROME_BIN", "CHROME_BIN"):
+        path = os.environ.get(env_name, "").strip()
+        if path and os.path.isfile(path):
+            return path, "env"
+    for name in ("google-chrome", "google-chrome-stable", "chromium",
+                 "chromium-browser", "chrome"):
+        path = shutil.which(name)
+        if path:
+            return path, "standard"
+    candidates = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/opt/google/chrome/chrome",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        os.path.expanduser("~/.cache/chrome-for-testing/chrome-linux64/chrome"),
+        os.path.expanduser("~/.cache/chrome-for-testing/google-chrome-linux64/chrome"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            how = "cache" if "chrome-for-testing" in path else "standard"
+            return path, how
+    return None, ""
+
+
+def _chrome_version(path: str) -> str:
+    """Run `chrome --version`; return the version string or ''."""
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True,
+                             text=True, timeout=15)
+    except Exception:  # noqa: BLE001 - binary missing / not runnable
+        return ""
+    if out.returncode != 0:
+        return ""
+    return (out.stdout or "").strip()
+
+
+def run_setup_check() -> int:
+    """Verify the setup for --browser and print plain-language results.
+
+    One line per check; exit 0 when everything needed for --browser
+    is present, 1 otherwise. Never attempts a signup.
+    """
+    problems: list[str] = []
+
+    # Python version (requirements: 3.9+).
+    py = sys.version_info
+    if py >= (3, 9):
+        print(f"Python {py.major}.{py.minor}.{py.micro} — OK (needs 3.9+)")
+    else:
+        print(f"Python {py.major}.{py.minor}.{py.micro} — TOO OLD (needs 3.9+)")
+        problems.append("Python older than 3.9")
+
+    # Required packages (requirements.txt). cv2 is optional: only the
+    # QR-decode fallback needs it, so it never fails the check.
+    for module, why in (("curl_cffi", "the HTTP route"),
+                        ("selenium", "the browser route"),
+                        ("webdriver_manager", "ChromeDriver downloads")):
+        ok, detail = _check_import(module)
+        if ok:
+            print(f"{module} — OK"
+                  + (f" ({detail})" if detail != "installed" else ""))
+        else:
+            print(f"{module} — MISSING (needed for {why}; "
+                  "pip install -r requirements.txt)")
+            problems.append(f"{module} is missing")
+    ok, detail = _check_import("cv2")
+    if ok:
+        print(f"OpenCV (cv2) — OK ({detail}); QR-decode fallback available")
+    else:
+        print("OpenCV (cv2) — missing (optional: only the QR-decode "
+              "fallback needs it; pip install opencv-python-headless "
+              "to enable it)")
+
+    # Google Chrome.
+    chrome_path, how = _find_chrome()
+    if chrome_path is None:
+        print("Google Chrome — NOT FOUND (install Google Chrome to "
+              "use --browser)")
+        problems.append("Google Chrome not found")
+    else:
+        version = _chrome_version(chrome_path)
+        shown = f"Google Chrome — {chrome_path}" + (f" ({version})"
+                                                    if version else "")
+        if how == "cache":
+            print(shown + " — found, but ChromeDriver does not look "
+                  "in the chrome-for-testing cache; set "
+                  "GMAIL_FARM_CHROME_BIN to this path to use it")
+            problems.append("Chrome only in the chrome-for-testing "
+                            "cache (set GMAIL_FARM_CHROME_BIN)")
+        elif how == "env":
+            print(shown + " — OK (from GMAIL_FARM_CHROME_BIN / "
+                  "CHROME_BIN)")
+        else:
+            print(shown + " — OK")
+
+    # ChromeDriver, via webdriver-manager — the same call the browser
+    # route uses. Its own download chatter is silenced so the check
+    # stays one line per check; a cached driver returns instantly.
+    ok_wdm, _ = _check_import("webdriver_manager")
+    if not ok_wdm:
+        print("ChromeDriver — skipped (webdriver-manager is missing)")
+    else:
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            with contextlib.redirect_stdout(io.StringIO()):
+                driver_path = ChromeDriverManager().install()
+            if os.path.isfile(driver_path):
+                print(f"ChromeDriver — OK: {driver_path}")
+            else:
+                print("ChromeDriver — FAILED (webdriver-manager "
+                      "returned a path that does not exist: "
+                      f"{driver_path})")
+                problems.append("ChromeDriver could not be obtained")
+        except Exception as exc:  # noqa: BLE001 - report, don't crash
+            print(f"ChromeDriver — FAILED ({exc}); check your network "
+                  "and try again")
+            problems.append("ChromeDriver could not be obtained")
+
+    if problems:
+        print(f"Setup NOT ready: {'; '.join(problems)}")
+        return 1
+    print("Setup OK — ready for --browser")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         cfg = build_config(argv)
@@ -65,6 +221,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"config error: {exc}", file=sys.stderr)
             return 1
         raise
+
+    # --check: verify the setup and exit without attempting a signup.
+    if cfg.check:
+        return run_setup_check()
 
     logger = setup_logging(cfg.log_file, verbose=cfg.verbose)
     logger.info("gmail-farm starting: count=%s delay=%.0fs out=%s proxy=%s dry_run=%s browser=%s",
@@ -122,6 +282,13 @@ def main(argv: list[str] | None = None) -> int:
             logger.info("[%d] attempt: %s", attempted, identity.public_summary())
             try:
                 if browser_create is not None:
+                    # --stop-at-consent / GMAIL_FARM_STOP_AT_CONSENT=1:
+                    # end the attempt at the DevicePhoneVerification
+                    # consent page (no "Send SMS" click on desktop)
+                    # and guide the user to finish it on their phone.
+                    stop_at_consent = cfg.stop_at_consent
+                    if stop_at_consent:
+                        logger.info("stop-at-consent mode ON")
                     result = browser_create(
                         identity, phone=cfg.phone or None,
                         proxy=cfg.proxy or None,
@@ -131,7 +298,8 @@ def main(argv: list[str] | None = None) -> int:
                         device=cfg.device,
                         entry_point=cfg.entry_point,
                         profile_dir=cfg.profile_dir or None,
-                        warm=cfg.warm)
+                        warm=cfg.warm,
+                        stop_at_consent=stop_at_consent)
                     # BrowserResult has no http_status / created flag;
                     # normalize to the HTTP result shape.
                     stage = result.stage

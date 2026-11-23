@@ -94,6 +94,21 @@ class Config:
     # True when the user set --qr-downgrade / --no-qr-downgrade
     # explicitly (used only for validation).
     _qr_downgrade_set: bool = False
+    # Stop at the DevicePhoneVerification consent page (browser
+    # route only): when the QR fallback trick reaches the consent
+    # page, stop there and guide the user to open its URL on their
+    # real phone and tap "Send SMS" there, instead of tapping
+    # "Send SMS" on this desktop browser (where it errors out, no
+    # SIM). Same as the GMAIL_FARM_STOP_AT_CONSENT env var.
+    # Default off.
+    stop_at_consent: bool = False
+    # True when the user set --stop-at-consent / --no-stop-at-consent
+    # explicitly (used only for validation).
+    _stop_at_consent_set: bool = False
+    # Setup check: --check verifies the setup (Python version,
+    # required packages, Google Chrome, ChromeDriver) and exits
+    # without attempting any signup.
+    check: bool = False
     # Device profile for the browser route: 'desktop' (default, a
     # random desktop Chrome UA) or 'ipad-mini' (the iPad Mini spoof
     # from google-qr-sms-helper: iPad UA, no Sec-CH-UA headers,
@@ -151,6 +166,8 @@ class Config:
             raise ValueError("--qr-pause / --no-qr-pause only applies with --browser")
         if self._qr_downgrade_set and not self.browser:
             raise ValueError("--qr-downgrade / --no-qr-downgrade only applies with --browser")
+        if self._stop_at_consent_set and not self.browser:
+            raise ValueError("--stop-at-consent / --no-stop-at-consent only applies with --browser")
         if self.device not in ("desktop", "ipad-mini", "android-phone"):
             raise ValueError("--device must be 'desktop', 'ipad-mini' "
                              "or 'android-phone'")
@@ -236,6 +253,19 @@ def build_config(argv: list[str] | None = None) -> Config:
                    "Verification RPCs -> SMS/voice selection page) "
                    "before pausing for a QR scan (browser route "
                    "only) [default: on]")
+    p.add_argument("--stop-at-consent", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="stop at Google's DevicePhoneVerification "
+                   "consent page instead of tapping 'Send SMS' on "
+                   "this desktop browser: print the consent URL and "
+                   "guide you to open it in Chrome on your phone "
+                   "and tap 'Send SMS' there (browser route only) "
+                   "[default: off; also settable with "
+                   "GMAIL_FARM_STOP_AT_CONSENT=1]")
+    p.add_argument("--check", action="store_true",
+                   help="check the setup (Python version, required "
+                   "packages, Google Chrome, ChromeDriver) and exit "
+                   "without attempting any signup")
     p.add_argument("--device", choices=["desktop", "ipad-mini", "android-phone"],
                    default=os.environ.get("GMAIL_FARM_DEVICE", "desktop"),
                    help="browser device profile (browser route only): "
@@ -298,6 +328,21 @@ def build_config(argv: list[str] | None = None) -> Config:
     else:
         qr_downgrade = True
         qr_downgrade_set = False
+    # --stop-at-consent / --no-stop-at-consent: same pattern,
+    # default off. The env var enables it too, but only an explicit
+    # flag counts as "set" for validation — the env var predates
+    # the flag and was silently ignored on non-browser runs, and
+    # that behaviour is kept.
+    stop_at_consent_env = os.environ.get("GMAIL_FARM_STOP_AT_CONSENT", "")
+    if args.stop_at_consent is not None:
+        stop_at_consent = args.stop_at_consent
+        stop_at_consent_set = True
+    elif stop_at_consent_env.lower() in ("1", "true", "yes", "on"):
+        stop_at_consent = True
+        stop_at_consent_set = False
+    else:
+        stop_at_consent = False
+        stop_at_consent_set = False
     cfg = Config(
         count=args.count,
         delay_seconds=args.delay,
@@ -321,6 +366,9 @@ def build_config(argv: list[str] | None = None) -> Config:
         _qr_pause_set=qr_pause_set,
         qr_downgrade=qr_downgrade,
         _qr_downgrade_set=qr_downgrade_set,
+        stop_at_consent=stop_at_consent,
+        _stop_at_consent_set=stop_at_consent_set,
+        check=args.check,
         device=args.device,
         entry_point=args.entry_point,
         profile_dir=args.profile_dir,

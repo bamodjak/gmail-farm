@@ -1214,6 +1214,54 @@ def _extract_begin_url(page_source: str) -> str:
     return "https://accounts.google.com/" + path
 
 
+def _decode_qr_begin_url(driver) -> str:
+    """Decode the QR code shown on the current page and return the
+    devicephoneverification begin URL it encodes, or ''.
+
+    The QR wall's begin URL is NOT in the page HTML — the QR is an
+    inline data:image/png whose pixels encode the URL (attempt #29,
+    Samuel Green, died here: "no devicephoneverification/begin URL
+    on the page"). Capture the QR image the same way _save_qr does
+    and decode it with OpenCV's QRCodeDetector (used before in this
+    repo for the same QR codes). Returns the full https URL, or ''
+    when there is no decodable QR (OpenCV missing, no QR element,
+    decode failure)."""
+    png, _source = _capture_qr_image(driver)
+    if not png:
+        return ""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        _log.warning("QR decode: OpenCV (cv2) not available")
+        return ""
+    try:
+        arr = np.frombuffer(png, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return ""
+        detector = cv2.QRCodeDetector()
+        candidates = [img]
+        try:
+            candidates.append(cv2.resize(
+                img, None, fx=2, fy=2,
+                interpolation=cv2.INTER_CUBIC))
+        except Exception:  # noqa: BLE001 - 1x decode may still work
+            pass
+        for attempt_img in candidates:
+            data, _pts, _straight = detector.detectAndDecode(attempt_img)
+            data = (data or "").strip()
+            if "devicephoneverification/begin?" in data:
+                if data.startswith("https://"):
+                    return data
+                if data.startswith("accounts.google.com/"):
+                    return "https://" + data
+                return "https://accounts.google.com/" + data.lstrip("/")
+    except Exception as exc:  # noqa: BLE001 - decode is best-effort
+        _log.warning("QR decode failed: %s", exc)
+    return ""
+
+
 def _try_qr_downgrade(driver, device: str):
     """Attempt the google-qr-sms-helper downgrade on the current
     crossflow page. Returns (status, detail) where status is
@@ -1225,8 +1273,16 @@ def _try_qr_downgrade(driver, device: str):
     html = driver.page_source or ""
     begin_url = _extract_begin_url(html)
     if not begin_url:
+        # The QR wall's begin URL is encoded in the QR image, not
+        # in the page HTML — decode the QR and use that.
+        begin_url = _decode_qr_begin_url(driver)
+        if begin_url:
+            _log.info("QR downgrade: begin URL decoded from the QR "
+                      "image (%s...)", begin_url[:80])
+    if not begin_url:
         return ("failed",
-                "no devicephoneverification/begin URL on the page")
+                "no devicephoneverification/begin URL on the page "
+                "(HTML has none and the QR image did not decode)")
     _log.info("QR downgrade: begin URL found (%s...)",
               begin_url[:80])
     # The extension uses the iPhone UA for /devicephoneverification/*
@@ -1588,7 +1644,8 @@ def create_account(identity: Identity, phone: str | None = None,
                    device: str = "desktop",
                    entry_point: str = "direct",
                    profile_dir: str | None = None,
-                   warm: bool = False) -> BrowserResult:
+                   warm: bool = False,
+                   stop_at_consent: bool = False) -> BrowserResult:
     """Run ONE Gmail signup in a real Chrome browser. Returns a
     BrowserResult. ``phone`` is the user's OWN number (E.164); when
     Google requires a number and none was supplied, the attempt ends
@@ -1628,6 +1685,23 @@ def create_account(identity: Identity, phone: str | None = None,
     YouTube, Maps, News) before the signup; it only makes sense
     with a persistent profile.
 
+    ``stop_at_consent`` (default False; also settable with the
+    --stop-at-consent flag or the GMAIL_FARM_STOP_AT_CONSENT=1 env
+    var) guides the user through the DevicePhoneVerification consent
+    page instead of ending the attempt there: it prints a numbered
+    guide with the consent URL, waits for the user to open the URL
+    in Chrome on their real phone, tap "Send SMS" and send the text
+    (on a desktop browser that click errors out, no SIM — the phone
+    is the only way), then reloads the page and lets the normal step
+    loop see whether verification completed, so the account is
+    recorded as 'created' only when the post-signup page is actually
+    reached. If the page has not advanced after that one reload, the
+    attempt returns stage='consent' with the URL. When stdin is not
+    a TTY (non-interactive run) it prints the URL and returns
+    stage='consent' immediately instead of waiting for input. The
+    browser is left OPEN on the consent page whenever the attempt
+    ends at that stage (see the finally block).
+
     The flow is a step loop, not a fixed sequence: Google A/B-tests
     the signup (username and password are sometimes one page,
     sometimes two; the "use your existing email" page sometimes
@@ -1641,6 +1715,9 @@ def create_account(identity: Identity, phone: str | None = None,
     driver = create_driver(proxy=proxy, headless=headless, device=device,
                            profile_dir=profile_dir)
     started = time.monotonic()
+    # stop-at-consent mode leaves the browser open on the consent
+    # page (the finally block below must not quit it).
+    keep_browser_open = False
     try:
         warm_up_session(driver, deep=warm and bool(profile_dir))
         if warm and not profile_dir:
@@ -1664,6 +1741,11 @@ def create_account(identity: Identity, phone: str | None = None,
 
         error_page_retries = 0
         downgrade_tried = False
+        # True once the guided consent flow has waited for the user
+        # to send the SMS on their phone and reloaded the page: the
+        # next visit to the consent page is the one observation pass
+        # — if it has not advanced, the attempt ends as 'consent'.
+        consent_waited = False
         last_step = ""
         same_step_count = 0
         for _step in range(8):
@@ -2120,6 +2202,95 @@ def create_account(identity: Identity, phone: str | None = None,
                                   " | ".join(_desc))
                     except Exception as _exc:  # noqa: BLE001 - best-effort
                         _log.warning("consent diagnostics failed: %s", _exc)
+                # STOP-AT-CONSENT: the downgrade landed the tab on
+                # the consent page. Do NOT click "Send SMS" (on this
+                # desktop browser it errors out, no SIM) — the
+                # owner's real phone sends it. Guide the user
+                # through the phone step, then reload and let the
+                # normal step loop see whether verification
+                # completed. Non-interactive (stdin is not a TTY):
+                # print the URL and return stage='consent' as
+                # before — a non-interactive run must never hang
+                # waiting for input.
+                if (stop_at_consent
+                        and "devicephoneverification/consent" in url):
+                    if consent_waited:
+                        # Already waited once and reloaded: the page
+                        # has not advanced — one observation pass is
+                        # enough.
+                        keep_browser_open = True
+                        return BrowserResult(
+                            "consent", identity.email,
+                            "consent page still showing after the "
+                            "SMS was sent; open this URL on the "
+                            "phone in Chrome to retry: "
+                            f"{url}")
+                    import sys as _sys
+                    _log.info("STOP-AT-CONSENT: consent page "
+                              "reached — URL: %s", url)
+                    print()
+                    print("=" * 64)
+                    print("CONSENT PAGE REACHED — YOUR PHONE FINISHES THIS")
+                    print("=" * 64)
+                    print()
+                    print("  Google switched the check to a text message.")
+                    print("  This browser cannot send it — your phone can.")
+                    print()
+                    print("  1. Open this link in Chrome on your phone:")
+                    print(f"     {url}")
+                    print()
+                    print("  2. Tap \"Send SMS\" — your Messages app opens")
+                    print("     with a text to Google.")
+                    print()
+                    print("  3. Send the text, then come back here and")
+                    print("     press Enter.")
+                    print()
+                    print("     (Type 'abort' and press Enter to stop")
+                    print("     here — the account is saved as stage")
+                    print("     'consent' with this URL.)")
+                    print("=" * 64)
+                    if not _sys.stdin.isatty():
+                        # No one can press Enter: hand the URL over
+                        # and stop, as before.
+                        keep_browser_open = True
+                        return BrowserResult(
+                            "consent", identity.email,
+                            "consent page reached (stop-at-consent); "
+                            "open this URL on the phone in Chrome: "
+                            f"{url}")
+                    try:
+                        _answer = input(
+                            "Press Enter once you have sent the text "
+                            "on your phone: ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        _answer = "abort"
+                    if _answer in ("abort", "quit", "exit", "q", "no"):
+                        keep_browser_open = True
+                        return BrowserResult(
+                            "consent", identity.email,
+                            "consent page reached (stop-at-consent); "
+                            "user stopped here — open this URL on "
+                            f"the phone in Chrome: {url}")
+                    # The user sent the SMS. The waiting time is
+                    # theirs, not the attempt's — restart the
+                    # attempt clock (as the QR pause does), reset
+                    # the same-step guard (the reload is a fresh
+                    # observation, not a stuck loop), reload, and
+                    # let the normal step loop see whether
+                    # verification completed.
+                    consent_waited = True
+                    started = time.monotonic()
+                    last_step = ""
+                    same_step_count = 0
+                    _log.info("consent: SMS sent on the phone; "
+                              "reloading to check whether verification "
+                              "completed")
+                    try:
+                        driver.get(url)
+                    except Exception as _exc:  # noqa: BLE001 - loop re-checks
+                        _log.warning("consent reload failed: %s", _exc)
+                    time.sleep(2)
+                    continue
                 # PROBE (2026-11-23): the consent page has no phone
                 # field at all — its only control is "Send SMS".
                 # Click it once and record what Google does next:
@@ -2181,7 +2352,11 @@ def create_account(identity: Identity, phone: str | None = None,
     except Exception as e:  # noqa: BLE001 - stage it, don't crash
         return BrowserResult("error", identity.email, f"{type(e).__name__}: {e}"[:300])
     finally:
-        try:
-            close_driver(driver)
-        except Exception:  # noqa: BLE001 - best-effort cleanup
-            pass
+        if keep_browser_open:
+            _log.info("stop-at-consent: leaving the browser OPEN on the "
+                      "consent page (Chrome NOT quit)")
+        else:
+            try:
+                close_driver(driver)
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass

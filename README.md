@@ -1,13 +1,72 @@
 # gmail-farm
 
-Create Google (Gmail) accounts in a loop — over HTTP by default, or
-in a real browser with `--browser`.
+**Create Gmail accounts automatically, from the command line.**
 
-General-purpose and reusable: no hardcoded personal details. Every
-setting is a CLI flag or an environment variable. Random names,
-usernames, passwords, birthdays and genders are generated per attempt.
+You give it a number. It opens Google's signup, fills in a random
+name, birthday, username and password, and tries to finish the
+account. Each attempt is saved to `accounts.jsonl` (email, password,
+and how far it got).
 
-## What it does
+It is a public, general-purpose tool: no hardcoded personal details,
+nothing tied to one person's setup. Every setting is a CLI flag or an
+environment variable, and it runs on Windows, Mac and Linux.
+
+## The short version
+
+- **It fills the whole signup form by itself** — name, birthday,
+  username, password — in a real Chrome browser.
+- **The hard part is Google's verification.** After the form, Google
+  almost always asks you to prove you are human with a phone. There
+  are three versions of that check, and the tool handles each one
+  differently (see "How verification works" below).
+- **It never pays for anything, never uses anyone else's phone
+  number, and never solves a CAPTCHA.** If it cannot finish an
+  account honestly, it says so and stops.
+- **Today, on a datacenter IP, it creates 0 accounts on its own.**
+  Google shows a phone check on every attempt. The tool gets you to
+  that check — and, with the QR fallback trick, turns it into a page
+  where your own phone can finish the job in one tap. Read the
+  Honest status section for the exact numbers.
+
+## How verification works (plain version)
+
+After the form, Google shows one of three checks. Which one appears
+depends on Google's risk score for your IP address and browser:
+
+1. **QR code page** — "Scan the QR code with your phone." There is
+   no button, no phone-number field, no Skip. You need a phone in
+   hand to scan it. The tool saves the QR code to a file and waits
+   for you (`--qr-pause`, on by default).
+2. **Same-device check** — "Do a device check. Use this phone to
+   verify." This appears when the browser looks like an Android
+   phone. Its Continue button hands off to the phone's own system,
+   so it only works when the signup itself runs on a real phone.
+3. **Consent page ("Send SMS")** — "Verify your phone number. Your
+   phone will open an SMS message with a code." This is what the
+   QR fallback trick produces (see below). It has one button,
+   "Send SMS", and no place to type a number. Tapping it on a real
+   phone opens your Messages app with a text to Google — you send
+   it, and Google verifies the account. On a desktop browser it
+   errors out, because there is no phone to send from.
+
+**The QR fallback trick** (`--qr-downgrade`, on by default) is the
+tool's best move. It takes the QR code Google shows, reads the
+verification link hidden inside it, and calls Google's own
+verification service to switch the check from "scan a QR code" to
+the consent page above. That part works — the service answers
+`[3,null,4]` and the consent page loads. What it cannot do is the
+last step: the SMS has to be sent from a real phone.
+
+**Finishing an account with your phone.** Run the tool with
+`--stop-at-consent` (or `GMAIL_FARM_STOP_AT_CONSENT=1`). It does the signup, runs the
+fallback trick, and stops at the consent page — then it prints a
+numbered guide with the consent page's link. Open that link in Chrome on your phone, tap
+"Send SMS", send the text, come back here and press Enter — the tool
+reloads the page and finishes the signup if verification completed.
+The tool records the account as `consent` (not `created`) until the signup
+is actually finished.
+
+## Quick start
 
 ```
 python3 gmail_farm.py --count 5            # attempt 5 accounts (HTTP)
@@ -29,10 +88,14 @@ Logs go to `gmail-farm.log` and the console.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python3 gmail_farm.py --check    # verify the setup, then run:
 python3 gmail_farm.py --count 1
 ```
 
 Requires Python 3.9+ and `curl_cffi` (browser TLS impersonation).
+`--check` verifies Python, the required packages, Google Chrome
+and ChromeDriver, one line per check, and exits without attempting
+a signup — run it first if anything fails.
 
 ### Browser route (`--browser`)
 
@@ -53,21 +116,24 @@ python3 gmail_farm.py --count 1 --browser --headed   # watch it run
 ```
 
 **Phone verification.** Google usually asks for phone verification
-at the end of signup. The tool handles it two ways, and only these:
+at the end of signup. The tool handles it three ways, and only these:
 
 1. **Skip** — it tries the Skip / Not now button first. On many
-   sessions there is no skip, and the attempt is abandoned as stage
-   `phone_verification`.
+   sessions there is no skip, and the attempt moves on to the next
+   option.
 2. **Your own number** — pass `--phone +<your number in E.164>` (or
    set `GMAIL_FARM_PHONE`). The tool fills YOUR number, submits it,
    and prompts you on the console for the SMS code you received. It
    never uses anyone else's number and never pays for one.
-
-Google sometimes demands a **QR-code scan on a real phone**
-instead of a number field (see Honest status). There is no skip and
-no field on that page — the tool cannot pass it, and reports stage
-`phone_verification` with the exact page state. You need a phone in
-hand to scan the code yourself.
+3. **QR wall → consent page → your phone** — Google sometimes
+   demands a **QR-code scan on a real phone** instead of a number
+   field (see Honest status). There is no skip and no field on that
+   page. The tool runs the QR fallback trick (`--qr-downgrade`, on
+   by default), which switches the check to the consent page, and
+   with `--stop-at-consent` it stops there, prints the consent
+   link with a numbered guide, and waits for you to send the SMS
+   from your phone and press Enter. The account is recorded as
+   `created` only when the signup actually finishes.
 
 **QR pause (`--qr-pause`, default on for `--browser`).** When the
 QR wall appears, the tool pauses instead of abandoning the attempt:
@@ -109,7 +175,7 @@ with no human step per account:
   kept as an option, not the answer.
 
 See Honest status for what these actually achieved (0 created in
-22 browser attempts on a datacenter IP, 2026-11-22/23) and what
+30 browser attempts on a datacenter IP, 2026-11-22/23) and what
 still blocks bulk creation.
 
 ## Options
@@ -130,7 +196,8 @@ still blocks bulk creation.
 | `--phone` | `GMAIL_FARM_PHONE` | (none) | your own phone number in E.164 (browser route only) |
 | `--headed` | — | off | show the Chrome window (browser route only) |
 | `--qr-pause` / `--no-qr-pause` | `GMAIL_FARM_QR_PAUSE` | on | pause at the QR wall: save the QR to a file, wait for you to scan it and press Enter (browser route only) |
-| `--qr-downgrade` / `--no-qr-downgrade` | `GMAIL_FARM_QR_DOWNGRADE` | on | at the QR/samedevice wall, first try the google-qr-sms-helper downgrade (DevicePhoneVerification RPCs -> consent page) before pausing for a QR scan (browser route only; verified: the RPCs return `[3,null,4]` on signup and the begin-page candidate reaches the consent page, but that page has no phone field and "Send SMS" errors out without a real phone/device — see Honest status) |
+| `--qr-downgrade` / `--no-qr-downgrade` | `GMAIL_FARM_QR_DOWNGRADE` | on | at the QR/samedevice wall, first try the QR fallback trick (read the verification link out of the QR code, call Google's DevicePhoneVerification service, switch the check to the consent page) before pausing for a QR scan (browser route only; verified: the service answers `[3,null,4]` and the consent page loads — but that page has no phone field, and "Send SMS" only works from a real phone, see "How verification works") |
+| `--stop-at-consent` / `--no-stop-at-consent` | `GMAIL_FARM_STOP_AT_CONSENT` | off | when the fallback trick reaches the consent page, stop there and print a numbered guide with the consent link: open it in Chrome on your phone, tap "Send SMS", send the text, press Enter here — the tool reloads and finishes the signup if verification completed (browser route only; non-interactive runs print the link and stop instead of waiting) |
 | `--device` | `GMAIL_FARM_DEVICE` | desktop | browser device profile: `desktop`, `ipad-mini` (iPad Mini spoof — verified NOT to change the signup QR wall) or `android-phone` (Pixel 8 / Android 14 Chrome — changes the wall to a "same device" check, still blocked) |
 | `--entry-point` | `GMAIL_FARM_ENTRY_POINT` | direct | browser signup entry point: `direct`, `youtube`, `drive`, `photos` (falls back to direct) — plus `cloud-console` (the google-qr-sms-helper entry point: reaches the form via a different flow, username-first, service=cloudconsole — verified live 2026-11-23, still the QR wall), `play` and `aistudio` (both dead: 'Create account' not found, same as youtube/drive/photos) |
 | `--profile-dir` | `GMAIL_FARM_PROFILE_DIR` | (none) | persistent Chrome profile dir, reused across attempts (browser route only) |
@@ -219,7 +286,7 @@ end-to-end through the whole form — and then hits a wall:
   the exact page state. It never enters a number, never pays, never
   solves a CAPTCHA, and never scans the QR code (it has no phone).
 
-**Result: 0 accounts created in 28 browser attempts (2026-11-22/23).** The browser
+**Result: 0 accounts created in 30 browser attempts (2026-11-22/23).** The browser
 route passes BotGuard (a real browser runs the challenge) but Google
 still demands a physical phone in hand for verification. Whether
 that QR wall appears depends on Google's risk score for the IP and
@@ -307,6 +374,20 @@ can actually reach a phone. The step loop now treats
 runs at most once per attempt (it used to loop and burn the whole
 attempt timeout).
 
+**Consent run (verified live 2026-11-23, Henry Davis).** The
+downgrade now also decodes the QR code straight from its image
+(the verification link is not in the page source — it is inside
+the QR picture), so it works even when the page has no link. That
+run reached the consent page in 99 seconds (QR wall at 66s,
+`[3,null,4]` from the service), and the tool stopped there with
+`--stop-at-consent` instead of probing "Send SMS". The consent
+link is handed to the user's phone with a numbered guide, and the
+tool waits for Enter, then reloads and finishes the signup if the
+SMS went through. The phone step itself is not yet live-proven:
+the one live try showed a malformed SMS number (starting with
+`//`, no digits), likely because the consent URL's `plt`
+parameter came back empty — a fresh consent run may fix it.
+
 **Username-field bugs found by live testing (fixed
 2026-11-22).** Two attempts died at the username step with
 `ElementNotInteractableException` (the field was found by
@@ -334,8 +415,8 @@ form completed, QR saved, pause triggered, attempt recorded as
 created, nothing faked). It needs a human with a phone per account,
 so it is a fallback, not bulk creation.
 
-**Bulk path (no per-account human step) — 0 created in 28 browser
-attempts (2026-11-22/23; 25 recorded in `accounts.jsonl`, 0
+**Bulk path (no per-account human step) — 0 created in 30 browser
+attempts (2026-11-22/23; 29 recorded in `accounts.jsonl`, 0
 created).** GitHub research (code read, not just descriptions — see
 `~/workspace/storebot/farm/IDEAS.md`) found no public code that
 technically bypasses Google's verification; every repo either warms
