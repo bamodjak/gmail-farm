@@ -109,6 +109,19 @@ class Config:
     # required packages, Google Chrome, ChromeDriver) and exits
     # without attempting any signup.
     check: bool = False
+    # List accounts: --list prints every account in accounts.jsonl
+    # (email, password, stage, date, consent link) and exits
+    # without attempting any signup. Read-only.
+    list_accounts: bool = False
+    # Stage filter for --list: only show accounts at this stage
+    # (e.g. created, consent, phone_verification). Empty = all.
+    stage_filter: str = ""
+    # Export accounts: --export [FILE] writes accounts.jsonl to a
+    # CSV (email, password, stage, created_at, consent_url, notes)
+    # and exits without attempting any signup. Read-only. Empty =
+    # no export; the flag's const (accounts.csv) applies when the
+    # flag is given without a file.
+    export_file: str = ""
     # Device profile for the browser route: 'desktop' (default, a
     # random desktop Chrome UA) or 'ipad-mini' (the iPad Mini spoof
     # from google-qr-sms-helper: iPad UA, no Sec-CH-UA headers,
@@ -183,6 +196,8 @@ class Config:
             raise ValueError("--profile-dir only applies with --browser")
         if self.warm and not self.browser:
             raise ValueError("--warm only applies with --browser")
+        if self.stage_filter and not self.list_accounts:
+            raise ValueError("--stage only applies with --list")
 
 
 def build_config(argv: list[str] | None = None) -> Config:
@@ -266,6 +281,22 @@ def build_config(argv: list[str] | None = None) -> Config:
                    help="check the setup (Python version, required "
                    "packages, Google Chrome, ChromeDriver) and exit "
                    "without attempting any signup")
+    p.add_argument("--list", dest="list_accounts", action="store_true",
+                   help="list the accounts in accounts.jsonl (one "
+                   "block per account: email, password, stage, date, "
+                   "consent link) and exit without attempting any "
+                   "signup; read-only, no Chrome, no network")
+    p.add_argument("--stage", default="",
+                   help="with --list, show only accounts at this "
+                   "stage (e.g. created, consent, "
+                   "phone_verification)")
+    p.add_argument("--export", nargs="?", const="accounts.csv", default="",
+                   metavar="FILE",
+                   help="export the accounts in accounts.jsonl to a "
+                   "CSV file (columns: email, password, stage, "
+                   "created_at, consent_url, notes) and exit without "
+                   "attempting any signup; read-only [default file "
+                   "when no FILE is given: accounts.csv]")
     p.add_argument("--device", choices=["desktop", "ipad-mini", "android-phone"],
                    default=os.environ.get("GMAIL_FARM_DEVICE", "desktop"),
                    help="browser device profile (browser route only): "
@@ -369,6 +400,9 @@ def build_config(argv: list[str] | None = None) -> Config:
         stop_at_consent=stop_at_consent,
         _stop_at_consent_set=stop_at_consent_set,
         check=args.check,
+        list_accounts=args.list_accounts,
+        stage_filter=args.stage,
+        export_file=args.export,
         device=args.device,
         entry_point=args.entry_point,
         profile_dir=args.profile_dir,

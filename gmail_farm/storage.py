@@ -28,6 +28,33 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def read_records(path: str) -> list[dict]:
+    """Read all attempt records from a JSONL file, in file order.
+
+    Missing file, blank lines and malformed lines are skipped
+    silently — the caller decides what to say when nothing comes
+    back. Read-only: never writes, never touches the network.
+    """
+    records: list[dict] = []
+    if not os.path.exists(path):
+        return records
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict):
+                    records.append(rec)
+    except OSError:
+        return records
+    return records
+
+
 class AccountStore:
     """Append-only JSONL store for attempt records."""
 
@@ -61,6 +88,10 @@ class AccountStore:
 
     def already_attempted(self, username: str) -> bool:
         return username in self._seen_usernames
+
+    def read_all(self) -> list[dict]:
+        """Return every record in the file (see read_records)."""
+        return read_records(self.path)
 
     def record(self, identity: Identity, stage: str, detail: str = "",
                http_status: int = 0) -> dict:

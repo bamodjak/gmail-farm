@@ -13,6 +13,9 @@ Usage:
     python3 gmail_farm.py --count 1 --browser --stop-at-consent
         # stop at the DevicePhoneVerification consent page and guide
         # you to finish the SMS step on your own phone
+    python3 gmail_farm.py --list                      # show every account in accounts.jsonl
+    python3 gmail_farm.py --list --stage created      # only the created accounts
+    python3 gmail_farm.py --export                    # write accounts.csv, no signup
 
 Plain HTTP is blocked by Google's BotGuard attestation (only a real
 browser can produce it), so --browser (Selenium + Chrome) is the
@@ -36,20 +39,24 @@ mode 600 — it contains passwords, keep it private).
 from __future__ import annotations
 
 import contextlib
+import csv
 import io
 import logging
 import os
 import random
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import time
+from collections import Counter
+from datetime import datetime
 
 from gmail_farm.config import build_config
 from gmail_farm.identities import generate_identity
 from gmail_farm.logging_setup import setup_logging
-from gmail_farm.storage import AccountStore
+from gmail_farm.storage import AccountStore, read_records
 
 # HttpClient / SignupFlow are imported lazily inside main() (HTTP path
 # only) so the --browser route and --help work without curl_cffi.
@@ -212,6 +219,127 @@ def run_setup_check() -> int:
     return 0
 
 
+def _format_when(ts: str) -> str:
+    """Format a record's ISO timestamp as 'YYYY-MM-DD HH:MM UTC'.
+
+    Falls back to the raw value when it does not parse.
+    """
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        return str(ts)
+
+
+def _consent_url(detail: str) -> str:
+    """Pull the DevicePhoneVerification consent URL out of a record.
+
+    Only the consent-stage records carry this link (the URL the
+    user opens on their phone to finish the SMS step). Other
+    records' detail text may contain unrelated URLs (a Google
+    sign-in page, a Selenium docs link) — those are NOT consent
+    links, so they are not returned here. "" when there is none.
+    """
+    if not detail:
+        return ""
+    match = re.search(
+        r"https://accounts\.google\.com/devicephoneverification/consent\?\S+",
+        detail)
+    return match.group(0).rstrip(".,)") if match else ""
+
+
+def _one_line(text: str, limit: int = 0) -> str:
+    """Collapse a detail string to one line (newlines -> spaces).
+
+    limit > 0 truncates with an ellipsis; 0 = keep it whole.
+    """
+    flat = re.sub(r"\s+", " ", str(text or "")).strip()
+    if limit and len(flat) > limit:
+        return flat[: limit - 1].rstrip() + "…"
+    return flat
+
+
+def run_list(cfg) -> int:
+    """--list: print every account in accounts.jsonl, read-only.
+
+    One block per account (reads well on a phone or a narrow
+    terminal): email, password, stage, date, consent link when
+    present, and a short note. --stage filters to one stage.
+    Missing or empty file prints a clear message, never a
+    traceback. Never starts Chrome, never touches the network.
+    """
+    records = read_records(cfg.out_file)
+    if not records:
+        print(f"No accounts yet — {cfg.out_file} is missing or "
+              "empty. Run the tool first to create some.")
+        return 0
+    counts = Counter(str(r.get("stage", "")) for r in records)
+    breakdown = ", ".join(f"{c} {s}" for s, c in sorted(counts.items())
+                          if s)
+    print(f"{len(records)} account(s) in {cfg.out_file}: {breakdown}")
+    stage = (cfg.stage_filter or "").strip().lower()
+    shown = records
+    if stage:
+        shown = [r for r in records
+                 if str(r.get("stage", "")).lower() == stage]
+        if not shown:
+            print(f"No accounts at stage '{cfg.stage_filter}'.")
+            return 0
+        print(f"Showing {len(shown)} at stage "
+              f"'{cfg.stage_filter}':")
+    print()
+    for i, rec in enumerate(shown, 1):
+        print(f"[{i}] {rec.get('email', '')}")
+        print(f"    Password: {rec.get('password', '')}")
+        print(f"    Stage: {rec.get('stage', '')}")
+        when = _format_when(str(rec.get("ts", "")))
+        if when:
+            print(f"    When: {when}")
+        url = _consent_url(str(rec.get("detail", "")))
+        if url:
+            print(f"    Consent link: {url}")
+        note = _one_line(str(rec.get("detail", "")), 160)
+        if note:
+            print(f"    Note: {note}")
+        print()
+    return 0
+
+
+def run_export(cfg) -> int:
+    """--export: write accounts.jsonl to a CSV file, read-only.
+
+    Columns: email, password, stage, created_at, consent_url,
+    notes. The notes column is the record's detail text with
+    newlines collapsed so each account stays on one CSV row.
+    Overwriting an existing export file is fine — it is a
+    generated view of accounts.jsonl, not the source of truth.
+    Never starts Chrome, never touches the network.
+    """
+    records = read_records(cfg.out_file)
+    path = cfg.export_file or "accounts.csv"
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["email", "password", "stage", "created_at",
+                        "consent_url", "notes"],
+            lineterminator="\n")
+        writer.writeheader()
+        for rec in records:
+            detail = str(rec.get("detail", ""))
+            writer.writerow({
+                "email": rec.get("email", ""),
+                "password": rec.get("password", ""),
+                "stage": rec.get("stage", ""),
+                "created_at": rec.get("ts", ""),
+                "consent_url": _consent_url(detail),
+                "notes": _one_line(detail),
+            })
+    print(f"Wrote {len(records)} account(s) to {path}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         cfg = build_config(argv)
@@ -225,6 +353,15 @@ def main(argv: list[str] | None = None) -> int:
     # --check: verify the setup and exit without attempting a signup.
     if cfg.check:
         return run_setup_check()
+
+    # --list / --export: read-only views over accounts.jsonl. They
+    # never start Chrome and never touch the network.
+    if cfg.list_accounts or cfg.export_file:
+        if cfg.list_accounts:
+            run_list(cfg)
+        if cfg.export_file:
+            run_export(cfg)
+        return 0
 
     logger = setup_logging(cfg.log_file, verbose=cfg.verbose)
     logger.info("gmail-farm starting: count=%s delay=%.0fs out=%s proxy=%s dry_run=%s browser=%s",

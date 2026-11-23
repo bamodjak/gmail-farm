@@ -82,6 +82,31 @@ line: email, password, stage reached, timestamp). The file is
 created with mode 600 because it contains passwords — keep it private.
 Logs go to `gmail-farm.log` and the console.
 
+## Seeing your accounts
+
+`accounts.jsonl` is the source of truth, but reading raw JSON is
+not a good way to use an account. Two read-only commands show the
+accounts in a form you can actually use — neither starts Chrome,
+touches the network, or attempts a signup:
+
+```
+python3 gmail_farm.py --list                  # every account, one block each
+python3 gmail_farm.py --list --stage created  # only the accounts that finished
+python3 gmail_farm.py --list --stage consent  # only the ones waiting on your phone
+python3 gmail_farm.py --export                # write accounts.csv
+python3 gmail_farm.py --export my-accounts.csv
+```
+
+`--list` prints one block per account — email, password, stage,
+date, and the consent link when there is one (a consent-stage
+account's link is what you open on your phone to finish it).
+`--export` writes a CSV with columns `email, password, stage,
+created_at, consent_url, notes`, so you can open it in a
+spreadsheet or hand it to another tool. The CSV is a generated
+view — `accounts.jsonl` stays the source of truth, and it stays
+mode 600: it contains passwords, so keep it private and do not
+share the CSV around either.
+
 ## Install
 
 ```bash
@@ -198,6 +223,9 @@ still blocks bulk creation.
 | `--qr-pause` / `--no-qr-pause` | `GMAIL_FARM_QR_PAUSE` | on | pause at the QR wall: save the QR to a file, wait for you to scan it and press Enter (browser route only) |
 | `--qr-downgrade` / `--no-qr-downgrade` | `GMAIL_FARM_QR_DOWNGRADE` | on | at the QR/samedevice wall, first try the QR fallback trick (read the verification link out of the QR code, call Google's DevicePhoneVerification service, switch the check to the consent page) before pausing for a QR scan (browser route only; verified: the service answers `[3,null,4]` and the consent page loads — but that page has no phone field, and "Send SMS" only works from a real phone, see "How verification works") |
 | `--stop-at-consent` / `--no-stop-at-consent` | `GMAIL_FARM_STOP_AT_CONSENT` | off | when the fallback trick reaches the consent page, stop there and print a numbered guide with the consent link: open it in Chrome on your phone, tap "Send SMS", send the text, press Enter here — the tool reloads and finishes the signup if verification completed (browser route only; non-interactive runs print the link and stop instead of waiting) |
+| `--list` | — | off | list the accounts in accounts.jsonl (one block per account: email, password, stage, date, consent link) and exit — read-only, no signup, no Chrome, no network |
+| `--stage <stage>` | — | (none) | with --list, show only accounts at this stage (e.g. created, consent, phone_verification) |
+| `--export [FILE]` | — | off | export accounts.jsonl to a CSV (email, password, stage, created_at, consent_url, notes) and exit — read-only; default file when no FILE is given: accounts.csv |
 | `--device` | `GMAIL_FARM_DEVICE` | desktop | browser device profile: `desktop`, `ipad-mini` (iPad Mini spoof — verified NOT to change the signup QR wall) or `android-phone` (Pixel 8 / Android 14 Chrome — changes the wall to a "same device" check, still blocked) |
 | `--entry-point` | `GMAIL_FARM_ENTRY_POINT` | direct | browser signup entry point: `direct`, `youtube`, `drive`, `photos` (falls back to direct) — plus `cloud-console` (the google-qr-sms-helper entry point: reaches the form via a different flow, username-first, service=cloudconsole — verified live 2026-11-23, still the QR wall), `play` and `aistudio` (both dead: 'Create account' not found, same as youtube/drive/photos) |
 | `--profile-dir` | `GMAIL_FARM_PROFILE_DIR` | (none) | persistent Chrome profile dir, reused across attempts (browser route only) |
